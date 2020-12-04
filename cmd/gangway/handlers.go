@@ -33,6 +33,12 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api/v1"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 const (
@@ -377,5 +383,78 @@ func generateInfo(w http.ResponseWriter, r *http.Request) *userInfo {
 		ClusterCA:    string(caBytes),
 		HTTPPath:     cfg.HTTPPath,
 	}
+
+	// Create namespace for clientID
+	clientset, err := getConfig("")
+
+	if err != nil {
+		fmt.Printf("Config issue = %v", err)
+		return nil
+	}
+
+	namespace_err := createNamespaceIfNotExists("mytest-namespace-gangway", clientset)
+	if namespace_err != nil {
+		fmt.Printf("Namespace creation failed = %v \n", err)
+		return nil
+	}
+
 	return info
+}
+
+func createNamespaceIfNotExists(namespace string, clientset *kubernetes.Clientset) error {
+
+	namespaces, err := clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	namespaceExists := false
+	for _, ns := range namespaces.Items {
+		if ns.ObjectMeta.Name == namespace {
+			namespaceExists = true
+			break
+		}
+	}
+
+	if !namespaceExists {
+		fmt.Printf("Creating namespace %s \n", namespace)
+		createOptions := metav1.CreateOptions{}
+
+		nsSpec := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+		ns, err := clientset.CoreV1().Namespaces().Create(context.TODO(), nsSpec, createOptions)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Namespace created.. %v \n", ns)
+	} else {
+		fmt.Print("Namespace already exists..\n")
+	}
+	return nil
+}
+
+func getConfig(pathToConfig string) (*kubernetes.Clientset, error) {
+	var config *rest.Config
+	var err error
+
+	fmt.Printf("Path to config = %s \n", pathToConfig)
+	if pathToConfig == "" {
+		fmt.Printf("Checking in cluster config.. \n")
+		// creates the in-cluster config
+		config, err = rest.InClusterConfig()
+	} else {
+		// use the current context in kubeconfig
+		config, err = clientcmd.BuildConfigFromFlags("", pathToConfig)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// creates the clientset
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
+	return clientset, err
 }
