@@ -1,0 +1,15 @@
+image: registry.k8s.work.iqvia.com/cio-centos-base
+
+stages:
+  - buildImage
+
+Build Admin Image:
+  stage: buildImage
+  image: docker:git
+  before_script:
+    - docker login -u $DOCKER_REGISTRY_USER -p $DOCKER_REGISTRY_PASSWORD $DOCKER_PUSH_REGISTRY_URL
+  script:
+    -  echo "hello"
+  only:
+    - master
+    - web
