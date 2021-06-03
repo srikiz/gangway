@@ -32,9 +32,14 @@ import (
 	"github.com/heptiolabs/gangway/internal/oidc"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
+	policy "k8s.io/api/policy/v1beta1"
+	rolev1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api/v1"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -47,18 +52,19 @@ const (
 
 // userInfo stores information about an authenticated user
 type userInfo struct {
-	ClusterName  string
-	Username     string
-	Claims       jwt.MapClaims
-	KubeCfgUser  string
-	IDToken      string
-	RefreshToken string
-	ClientID     string
-	ClientSecret string
-	IssuerURL    string
-	APIServerURL string
-	ClusterCA    string
-	HTTPPath     string
+	ClusterName   string
+	Username      string
+	Claims        jwt.MapClaims
+	KubeCfgUser   string
+	IDToken       string
+	RefreshToken  string
+	ClientID      string
+	ClientSecret  string
+	IssuerURL     string
+	APIServerURL  string
+	ClusterCA     string
+	HTTPPath      string
+	UserNamespace string
 }
 
 // homeInfo is used to store dynamic properties on
@@ -369,67 +375,141 @@ func generateInfo(w http.ResponseWriter, r *http.Request) *userInfo {
 		log.Warn("Setting an empty Client Secret should only be done if you have no other option and is an inherent security risk.")
 	}
 
-	info := &userInfo{
-		ClusterName:  cfg.ClusterName,
-		Username:     username,
-		Claims:       claims,
-		KubeCfgUser:  kubeCfgUser,
-		IDToken:      idToken,
-		RefreshToken: refreshToken,
-		ClientID:     cfg.ClientID,
-		ClientSecret: cfg.ClientSecret,
-		IssuerURL:    issuerURL,
-		APIServerURL: cfg.APIServerURL,
-		ClusterCA:    string(caBytes),
-		HTTPPath:     cfg.HTTPPath,
-	}
-
 	// Create namespace for clientID
 	clientset, err := getConfig("")
 
 	if err != nil {
-		fmt.Printf("Config issue = %v", err)
-		return nil
+		log.Warningf("Config issue for creating namespace. Error = %v", err)
 	}
 
-	namespace_err := createNamespaceIfNotExists("mytest-namespace-gangway", clientset)
+	namespace, namespace_err := createUserNamespace(username, clientset)
 	if namespace_err != nil {
-		fmt.Printf("Namespace creation failed = %v \n", err)
-		return nil
+		if statusError, isStatus := namespace_err.(*errors.StatusError); isStatus {
+			log.Warningf("Error = %s\n", statusError.ErrStatus.Message)
+		} else {
+			log.Warningf("Error creating namespace %v\n", namespace_err.Error())
+		}
+	}
+
+	policy_err := createPSPPolicy("autoprovisioned-psp-policy", clientset)
+	if policy_err != nil {
+		if statusError, isStatus := policy_err.(*errors.StatusError); isStatus {
+			log.Warningf("Error = %s\n", statusError.ErrStatus.Message)
+		} else {
+			log.Warningf("Error creating psp %v\n", policy_err.Error())
+		}
+	}
+
+	clusterrole_err := createClusterRoleForPSP("clusterole-autoprovisioned-psp", clientset)
+	if clusterrole_err != nil {
+		if statusError, isStatus := clusterrole_err.(*errors.StatusError); isStatus {
+			log.Warningf("Error = %s\n", statusError.ErrStatus.Message)
+		} else {
+			log.Warningf("Error creating cluster role %v\n", clusterrole_err.Error())
+		}
+	}
+
+	rolebinding_psp_err := createRoleBindingForPSP(namespace, "clusterole-autoprovisioned-psp", clientset)
+	if rolebinding_psp_err != nil {
+		if statusError, isStatus := rolebinding_psp_err.(*errors.StatusError); isStatus {
+			log.Warningf("Error = %s\n", statusError.ErrStatus.Message)
+		} else {
+			log.Warningf("Error creating role binding for psp %v\n", rolebinding_psp_err.Error())
+		}
+	}
+
+	rolebinding_err := createRoleBindingForUser(namespace, username, clientset)
+	if rolebinding_err != nil {
+		if statusError, isStatus := rolebinding_err.(*errors.StatusError); isStatus {
+			log.Warningf("Error = %s\n", statusError.ErrStatus.Message)
+		} else {
+			log.Warningf("Error creating role binding for user %v\n", rolebinding_err.Error())
+		}
+	}
+
+	info := &userInfo{
+		ClusterName:   cfg.ClusterName,
+		Username:      username,
+		Claims:        claims,
+		KubeCfgUser:   kubeCfgUser,
+		IDToken:       idToken,
+		RefreshToken:  refreshToken,
+		ClientID:      cfg.ClientID,
+		ClientSecret:  cfg.ClientSecret,
+		IssuerURL:     issuerURL,
+		APIServerURL:  cfg.APIServerURL,
+		ClusterCA:     string(caBytes),
+		HTTPPath:      cfg.HTTPPath,
+		UserNamespace: namespace,
 	}
 
 	return info
 }
 
-func createNamespaceIfNotExists(namespace string, clientset *kubernetes.Clientset) error {
+func createUserNamespace(emailAddress string, clientset *kubernetes.Clientset) (string, error) {
 
-	namespaces, err := clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		return err
-	}
+	// Split string with "." and join them. Later split with @ and join with first 2 characters of the domain.
+	namespace := createUniqueNamespaceString(emailAddress)
 
-	namespaceExists := false
-	for _, ns := range namespaces.Items {
-		if ns.ObjectMeta.Name == namespace {
-			namespaceExists = true
-			break
-		}
-	}
-
-	if !namespaceExists {
-		fmt.Printf("Creating namespace %s \n", namespace)
-		createOptions := metav1.CreateOptions{}
-
-		nsSpec := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
-		ns, err := clientset.CoreV1().Namespaces().Create(context.TODO(), nsSpec, createOptions)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Namespace created.. %v \n", ns)
+	_, err := clientset.CoreV1().Namespaces().Get(context.TODO(), namespace, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		fmt.Printf("Namespace %s not found\n", namespace)
+	} else if err != nil {
+		return "", err
 	} else {
-		fmt.Print("Namespace already exists..\n")
+		fmt.Printf("namespace %s already exists\n", namespace)
+		return namespace, nil
 	}
-	return nil
+
+	fmt.Printf("Creating namespace %s \n", namespace)
+	createOptions := metav1.CreateOptions{}
+
+	nsSpec := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+	ns, err := clientset.CoreV1().Namespaces().Create(context.TODO(), nsSpec, createOptions)
+	if err != nil {
+		return "", err
+	} else {
+		fmt.Printf("Namespace created.. %s \n", ns.ObjectMeta.Name)
+
+		labelPatch := `[{"op": "add", "path": "/metadata/labels", "value": {"autoprovisioned": "true" }}]`
+		fmt.Printf("label patch = %s", labelPatch)
+
+		_, err = clientset.CoreV1().Namespaces().Patch(context.TODO(), namespace, types.JSONPatchType, []byte(labelPatch), metav1.PatchOptions{})
+
+		if statusError, isStatus := err.(*errors.StatusError); isStatus {
+			fmt.Printf("Error applying label patch %v\n", statusError)
+			return "", err
+		} else if err != nil {
+			fmt.Printf("Error patching label for namespace %s, error=%v\n", namespace, err.Error())
+			return "", err
+		}
+	}
+
+	return namespace, nil
+}
+
+func createUniqueNamespaceString(emailAddress string) (namespace string) {
+	// Split string with "." and join them. Later split with @ and join with first 2 characters of the domain.
+	fmt.Printf("Email=%s \n", emailAddress)
+	emailWithDash := strings.Join(strings.Split(emailAddress, "."), "-")
+	fmt.Printf("Email with Dot Replaced with dash=%s \n", emailWithDash)
+
+	stringArray := strings.Split(emailWithDash, "@")
+	strippedDomain := "xiq"
+
+	if len(stringArray) > 1 {
+		domainName := stringArray[1]
+		strippedDomain = "x" + domainName[0:2]
+	}
+
+	newStringArray := []string{strippedDomain, stringArray[0]}
+
+	namespace = strings.Join(newStringArray, "-")
+	if len(namespace) > 63 {
+		namespace = namespace[0:63]
+	}
+
+	return strings.ToLower(namespace)
 }
 
 func getConfig(pathToConfig string) (*kubernetes.Clientset, error) {
@@ -457,4 +537,222 @@ func getConfig(pathToConfig string) (*kubernetes.Clientset, error) {
 	}
 
 	return clientset, err
+}
+
+func createRoleBindingForUser(namespace string, emailAddress string, clientset *kubernetes.Clientset) error {
+
+	roleBindings, err := clientset.RbacV1().RoleBindings(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	roleBindingExists := false
+	roleBindingName := namespace + "-rb"
+	for _, ns := range roleBindings.Items {
+		if ns.ObjectMeta.Name == roleBindingName {
+			roleBindingExists = true
+			break
+		}
+	}
+
+	if !roleBindingExists {
+		fmt.Printf("Creating rolebinding %s \n", roleBindingName)
+		createOptions := metav1.CreateOptions{}
+
+		subject := rolev1.Subject{Kind: "User", APIGroup: "rbac.authorization.k8s.io", Name: emailAddress}
+		subjectArray := []rolev1.Subject{subject}
+
+		roleRef := rolev1.RoleRef{Kind: "ClusterRole", APIGroup: "rbac.authorization.k8s.io", Name: "admin"}
+
+		roleBindingSpec := &rolev1.RoleBinding{Subjects: subjectArray, RoleRef: roleRef, ObjectMeta: metav1.ObjectMeta{Name: roleBindingName}}
+
+		rb, err := clientset.RbacV1().RoleBindings(namespace).Create(context.TODO(), roleBindingSpec, createOptions)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("RoleBinding created.. %s \n", rb.ObjectMeta.Name)
+	}
+
+	return nil
+}
+
+func createPSPPolicy(psp_name string, clientset *kubernetes.Clientset) error {
+
+	psp_policy, err := clientset.PolicyV1beta1().PodSecurityPolicies().Get(context.TODO(), psp_name, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		fmt.Printf("psp_policy not found\n")
+	} else if err != nil {
+		return err
+	} else {
+		fmt.Printf("autoprovisioned-psp-policy already exists..\n")
+		return nil
+	}
+
+	// Create a PSP with strategies that will populate a blank psc
+	allowPrivilegeEscalation := false
+	volumeOptions := []policy.FSType{"configMap", "emptyDir", "projected", "secret", "downwardAPI", "persistentVolumeClaim"}
+	createPSP := func() *policy.PodSecurityPolicy {
+		return &policy.PodSecurityPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: psp_name,
+			},
+			Spec: policy.PodSecurityPolicySpec{
+				AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+				RunAsUser: policy.RunAsUserStrategyOptions{
+					Rule: policy.RunAsUserStrategyMustRunAsNonRoot,
+				},
+				RunAsGroup: &policy.RunAsGroupStrategyOptions{
+					Rule: policy.RunAsGroupStrategyRunAsAny,
+				},
+				SELinux: policy.SELinuxStrategyOptions{
+					Rule: policy.SELinuxStrategyRunAsAny,
+				},
+				FSGroup: policy.FSGroupStrategyOptions{
+					Rule: policy.FSGroupStrategyMayRunAs,
+				},
+				SupplementalGroups: policy.SupplementalGroupsStrategyOptions{
+					Rule: policy.SupplementalGroupsStrategyMayRunAs,
+				},
+				Volumes: volumeOptions,
+			},
+		}
+	}
+
+	psp := createPSP()
+
+	psp_policy, err = clientset.PolicyV1beta1().PodSecurityPolicies().Create(context.TODO(), psp, metav1.CreateOptions{})
+	if err != nil {
+		return err
+	} else {
+		fmt.Printf("Psp policy created with response %s\n", psp_policy.ObjectMeta.Name)
+	}
+
+	return nil
+}
+
+func createClusterRoleForPSP(clusterrole string, clientset *kubernetes.Clientset) error {
+
+	_, err := clientset.RbacV1().ClusterRoles().Get(context.TODO(), clusterrole, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		fmt.Printf("cluster role %s not found\n", clusterrole)
+	} else if err != nil {
+		return err
+	} else {
+		fmt.Printf("clusterrole %s already exists..\n", clusterrole)
+		return nil
+	}
+
+	fmt.Printf("Creating cluster role %s \n", clusterrole)
+	createOptions := metav1.CreateOptions{}
+
+	policyRule := rolev1.PolicyRule{
+		Verbs:         []string{"Use"},
+		APIGroups:     []string{"policy"},
+		Resources:     []string{"podsecuritypolicies"},
+		ResourceNames: []string{"autoprovisioned-psp-policy"},
+	}
+
+	rulesArray := []rolev1.PolicyRule{policyRule}
+
+	clusterRoleSpec := &rolev1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterrole},
+		Rules:      rulesArray,
+	}
+
+	rb, err := clientset.RbacV1().ClusterRoles().Create(context.TODO(), clusterRoleSpec, createOptions)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Cluster Role %s created..\n", rb.ObjectMeta.Name)
+
+	return nil
+}
+
+func createRoleBindingForPSP(namespace string, clusterrole string, clientset *kubernetes.Clientset) error {
+
+	roleBindings, err := clientset.RbacV1().RoleBindings(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	roleBindingExists := false
+	roleBindingName := namespace + "-psp-rb"
+	for _, ns := range roleBindings.Items {
+		if ns.ObjectMeta.Name == roleBindingName {
+			roleBindingExists = true
+			break
+		}
+	}
+
+	if !roleBindingExists {
+		fmt.Printf("Creating rolebinding %s \n", roleBindingName)
+		createOptions := metav1.CreateOptions{}
+
+		sa_subject := rolev1.Subject{Kind: "Group", APIGroup: "rbac.authorization.k8s.io", Name: "system:serviceaccounts"}
+		authenticated_subject := rolev1.Subject{Kind: "Group", APIGroup: "rbac.authorization.k8s.io", Name: "system:authenticated"}
+		subjectArray := []rolev1.Subject{sa_subject, authenticated_subject}
+
+		roleRef := rolev1.RoleRef{Kind: "ClusterRole", APIGroup: "rbac.authorization.k8s.io", Name: clusterrole}
+
+		roleBindingSpec := &rolev1.RoleBinding{Subjects: subjectArray, RoleRef: roleRef, ObjectMeta: metav1.ObjectMeta{Name: roleBindingName}}
+
+		rb, err := clientset.RbacV1().RoleBindings(namespace).Create(context.TODO(), roleBindingSpec, createOptions)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("RoleBinding created.. %s \n", rb.ObjectMeta.Name)
+	}
+
+	return nil
+}
+
+func createLimitRanger(namespace string, clientset *kubernetes.Clientset) error {
+	limitRangeName := namespace + "-limitRange"
+
+	limitRange, err := clientset.CoreV1().LimitRanges(namespace).Get(context.TODO(), limitRangeName, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		fmt.Printf("limit Range not found\n")
+	} else if err != nil {
+		return err
+	} else {
+		fmt.Printf("limit range %s already exists..\n", limitRangeName)
+		return nil
+	}
+
+	// Create a Limit Range Object with default request and limits.
+
+	limitRangeObj := &v1.LimitRange{
+		ObjectMeta: metav1.ObjectMeta{Name: limitRangeName},
+		Spec: v1.LimitRangeSpec{
+			Limits: []v1.LimitRangeItem{
+				{
+					Type:                 v1.LimitTypeContainer,
+					DefaultRequest:       getResourceList("50m", "100Mi"),
+					Default:              getResourceList("200m", "500Mi"),
+					MaxLimitRequestRatio: v1.ResourceList{},
+				},
+			},
+		},
+	}
+
+	limitRange, err = clientset.CoreV1().LimitRanges(namespace).Create(context.TODO(), limitRangeObj, metav1.CreateOptions{})
+	if err != nil {
+		return err
+	} else {
+		fmt.Printf("Psp policy created with response %s\n", limitRange.ObjectMeta.Name)
+	}
+
+	return nil
+}
+
+func getResourceList(cpu, memory string) v1.ResourceList {
+	res := v1.ResourceList{}
+	if cpu != "" {
+		res[v1.ResourceCPU] = resource.MustParse(cpu)
+	}
+	if memory != "" {
+		res[v1.ResourceMemory] = resource.MustParse(memory)
+	}
+
+	return res
 }
