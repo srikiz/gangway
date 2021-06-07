@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-PROJECT := gangway
+PROJECT := ciok-gangway
 # Where to push the docker image.
-REGISTRY ?= gcr.io/heptio-images
+REGISTRY ?= regpush.k8s.work.iqvia.com
 IMAGE := $(REGISTRY)/$(PROJECT)
 SRCDIRS := ./cmd/gangway
 PKGS := $(shell go list ./cmd/... ./internal/...)
 
-VERSION ?= master
+VERSION ?= v4.0
 
 all: build
 
@@ -67,5 +67,9 @@ image:
 
 push:
 	docker push $(IMAGE):$(VERSION)
+
+cio-push:
+	docker push $(IMAGE):$(COMMIT_SHA)
+	docker push $(IMAGE):$(COMMIT_REF_NAME)
 
 .PHONY: all deps bindata test image setup

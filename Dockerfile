@@ -1,6 +1,18 @@
 FROM golang:1.14.2-stretch
 WORKDIR /go/src/github.com/heptiolabs/gangway
 
+RUN apt-get update &&  \
+	apt-get install bash \
+    tar \
+	curl \
+	jq \
+    git \
+    ca-certificates && rm -rf /var/cache/apk*
+
+COPY ./cacert.crt /usr/local/share/ca-certificates/cacert.crt
+RUN update-ca-certificates
+
+
 RUN go get -u github.com/mjibson/esc/...
 COPY . .
 RUN esc -o cmd/gangway/bindata.go templates/
