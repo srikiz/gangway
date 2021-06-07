@@ -69,6 +69,9 @@ push:
 	docker push $(IMAGE):$(VERSION)
 
 cio-push:
+	docker build . -t $(IMAGE)
+	docker tag $(IMAGE) $(IMAGE):$(COMMIT_SHA)
+	docker tag $(IMAGE) $(IMAGE):$(COMMIT_REF_NAME)
 	docker push $(IMAGE):$(COMMIT_SHA)
 	docker push $(IMAGE):$(COMMIT_REF_NAME)
 
